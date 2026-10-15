@@ -128,35 +128,113 @@ func (s *PlayQueueService) Get(ctx context.Context, userID string) (PlayQueueRes
 	if err != nil {
 		return PlayQueueResult{}, err
 	}
-	trackAnn, _ := s.annotations.AnnotationMap(ctx, userID, models.ItemTrack)
-	entryMeta := make(map[string]models.QueueEntry, len(q.Entries))
-	for _, e := range q.Entries {
-		entryMeta[e.ID] = e
+	q, tracks, err := s.resolveQueue(ctx, q)
+	if err != nil {
+		return PlayQueueResult{}, err
 	}
-	entries := make([]TrackEntry, 0, len(q.TrackIDs))
-	for _, id := range q.TrackIDs {
-		if t, err := s.catalog.GetTrack(ctx, id); err == nil {
-			entries = append(entries, TrackEntry{Track: t, Annotation: annPtr(trackAnn, id)})
-			continue
-		}
-		// Not in the local catalog — most commonly a not-yet-downloaded
-		// on-demand remote track, which was never inserted as a real row.
-		// Fall back to whatever the saving client reported about it, so it
-		// doesn't just vanish from another device's mirrored queue the
-		// moment it becomes current.
-		if meta, ok := entryMeta[id]; ok {
-			entries = append(entries, TrackEntry{Track: models.Track{
-				ID:         meta.ID,
-				Title:      meta.Title,
-				ArtistName: meta.Artist,
-				AlbumName:  meta.Album,
-				CoverArt:   meta.CoverArt,
-				Duration:   meta.Duration,
-				Remote:     meta.Remote,
-			}})
-		}
+	trackAnn, _ := s.annotations.AnnotationMap(ctx, userID, models.ItemTrack)
+	entries := make([]TrackEntry, 0, len(tracks))
+	for _, track := range tracks {
+		entries = append(entries, TrackEntry{Track: track, Annotation: annPtr(trackAnn, track.ID)})
 	}
 	return PlayQueueResult{Queue: q, Entries: entries, TargetOnline: s.online(userID, q.TargetDeviceID)}, nil
+}
+
+// resolveQueue removes stale local tracks from a saved queue while retaining
+// metadata-only entries for remote tracks that have not been downloaded yet.
+// A local track missing from the catalog can never be streamed; restoring it
+// would leave the player apparently active on an unplayable track.
+func (s *PlayQueueService) resolveQueue(ctx context.Context, q models.PlayQueue) (models.PlayQueue, []models.Track, error) {
+	entryMeta := make(map[string]models.QueueEntry, len(q.Entries))
+	for _, entry := range q.Entries {
+		entryMeta[entry.ID] = entry
+	}
+
+	currentIndex := -1
+	for i, id := range q.TrackIDs {
+		if id == q.Current {
+			currentIndex = i
+			break
+		}
+	}
+
+	trackIDs := make([]string, 0, len(q.TrackIDs))
+	entries := make([]models.QueueEntry, 0, len(q.TrackIDs))
+	tracks := make([]models.Track, 0, len(q.TrackIDs))
+	originalIndexes := make([]int, 0, len(q.TrackIDs))
+	for i, id := range q.TrackIDs {
+		track, err := s.catalog.GetTrack(ctx, id)
+		if err == nil {
+			trackIDs = append(trackIDs, id)
+			tracks = append(tracks, track)
+			originalIndexes = append(originalIndexes, i)
+			entries = append(entries, models.QueueEntry{
+				ID: id, Title: track.Title, Artist: track.ArtistName, Album: track.AlbumName,
+				CoverArt: track.CoverArt, Duration: track.Duration, Remote: track.Remote,
+			})
+			continue
+		}
+		if !errors.Is(err, persistence.ErrNotFound) {
+			return q, nil, err
+		}
+
+		// Only retain an unresolved id when it is known to be a remote track.
+		// Falling back for a deleted local track makes it look playable even
+		// though the eventual stream request will return 404.
+		meta, hasMeta := entryMeta[id]
+		if !hasMeta || (!meta.Remote && !IsRemoteID(id)) {
+			continue
+		}
+		trackIDs = append(trackIDs, id)
+		originalIndexes = append(originalIndexes, i)
+		track = models.Track{ID: id, Remote: true}
+		if hasMeta {
+			track.Title = meta.Title
+			track.ArtistName = meta.Artist
+			track.AlbumName = meta.Album
+			track.CoverArt = meta.CoverArt
+			track.Duration = meta.Duration
+			entries = append(entries, models.QueueEntry{
+				ID: id, Title: meta.Title, Artist: meta.Artist, Album: meta.Album,
+				CoverArt: meta.CoverArt, Duration: meta.Duration, Remote: true,
+			})
+		}
+		tracks = append(tracks, track)
+	}
+
+	q.TrackIDs = trackIDs
+	q.Entries = entries
+	if q.Current != "" && !containsTrackID(trackIDs, q.Current) {
+		if len(trackIDs) == 0 {
+			q.Current = ""
+		} else {
+			next := 0
+			for i, originalIndex := range originalIndexes {
+				if currentIndex < 0 || originalIndex >= currentIndex {
+					next = i
+					break
+				}
+			}
+			q.Current = trackIDs[next]
+		}
+		q.PositionMs = 0
+		q.Playing = false
+	}
+	if len(trackIDs) == 0 {
+		q.Current = ""
+		q.PositionMs = 0
+		q.Playing = false
+	}
+	return q, tracks, nil
+}
+
+func containsTrackID(ids []string, id string) bool {
+	for _, candidate := range ids {
+		if candidate == id {
+			return true
+		}
+	}
+	return false
 }
 
 // Save persists the user's play queue, stamped with the current time, and
@@ -190,7 +268,7 @@ func (s *PlayQueueService) SaveFromDevice(ctx context.Context, userID, current s
 }
 
 func (s *PlayQueueService) save(ctx context.Context, userID, current string, positionMs int64, playing bool, changedBy string, trackIDs []string, entries []models.QueueEntry, shuffle bool, repeat string) error {
-	if err := s.playQueues.Save(ctx, models.PlayQueue{
+	q, _, err := s.resolveQueue(ctx, models.PlayQueue{
 		UserID:     userID,
 		Current:    current,
 		PositionMs: positionMs,
@@ -201,7 +279,11 @@ func (s *PlayQueueService) save(ctx context.Context, userID, current string, pos
 		Entries:    entries,
 		Shuffle:    shuffle,
 		Repeat:     repeat,
-	}); err != nil {
+	})
+	if err != nil {
+		return err
+	}
+	if err := s.playQueues.Save(ctx, q); err != nil {
 		return err
 	}
 	s.notify(ctx, userID)
