@@ -95,42 +95,42 @@ export function SearchResults({ onClose }: { onClose: () => void }) {
     if (recents.length === 0) {
       return <EmptyState icon="search" title={t('components.search.searchTitle')} subtitle={t('components.search.searchSubtitle')} />;
     }
-      return (
-        <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: 12 }}>
-          <View className="flex-row items-center justify-between px-4 pb-1 pt-3">
-            <Text className="text-base font-bold text-foreground">{t('components.search.recentSearches')}</Text>
+    return (
+      <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={{ paddingBottom: 12 }}>
+        <View className="flex-row items-center justify-between px-4 pb-1 pt-3">
+          <Text className="text-base font-bold text-foreground">{t('components.search.recentSearches')}</Text>
+          <Pressable
+            onPress={clearRecents}
+            accessibilityRole="button"
+            accessibilityLabel={t('components.search.clearAllRecents')}
+            className="rounded px-2 py-1 active:bg-surface-alt"
+          >
+            <Text className="text-sm font-medium text-muted">{t('components.search.clearAll')}</Text>
+          </Pressable>
+        </View>
+        {recents.map((r) => (
+          <View key={r} className="flex-row items-center px-4 active:bg-surface-alt">
             <Pressable
-              onPress={clearRecents}
-              accessibilityRole="button"
-              accessibilityLabel={t('components.search.clearAllRecents')}
-              className="rounded px-2 py-1 active:bg-surface-alt"
+              onPress={() => setQuery(r)}
+              className="flex-1 flex-row items-center gap-3 py-3"
             >
-              <Text className="text-sm font-medium text-muted">{t('components.search.clearAll')}</Text>
+              <Ionicon name="time-outline" size={20} color={colors.muted} />
+              <Text className="flex-1 text-base text-foreground">{r}</Text>
+              <Ionicon name="arrow-forward-outline" size={16} color={colors.muted} />
+            </Pressable>
+            <Pressable
+              onPress={() => removeRecent(r)}
+              accessibilityRole="button"
+              accessibilityLabel={t('components.search.removeRecent', { query: r })}
+              hitSlop={8}
+              className="ml-1 items-center justify-center rounded p-2 active:bg-surface-alt"
+            >
+              <Ionicon name="close-outline" size={18} color={colors.muted} />
             </Pressable>
           </View>
-          {recents.map((r) => (
-            <View key={r} className="flex-row items-center px-4 active:bg-surface-alt">
-              <Pressable
-                onPress={() => setQuery(r)}
-                className="flex-1 flex-row items-center gap-3 py-3"
-              >
-                <Ionicon name="time-outline" size={20} color={colors.muted} />
-                <Text className="flex-1 text-base text-foreground">{r}</Text>
-                <Ionicon name="arrow-forward-outline" size={16} color={colors.muted} />
-              </Pressable>
-              <Pressable
-                onPress={() => removeRecent(r)}
-                accessibilityRole="button"
-                accessibilityLabel={t('components.search.removeRecent', { query: r })}
-                hitSlop={8}
-                className="ml-1 items-center justify-center rounded p-2 active:bg-surface-alt"
-              >
-                <Ionicon name="close-outline" size={18} color={colors.muted} />
-              </Pressable>
-            </View>
-          ))}
-        </ScrollView>
-      );
+        ))}
+      </ScrollView>
+    );
   }
 
   if (isLoading) return <Loading />;
