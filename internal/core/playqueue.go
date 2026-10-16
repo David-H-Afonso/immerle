@@ -140,14 +140,18 @@ func (s *PlayQueueService) Get(ctx context.Context, userID string) (PlayQueueRes
 	return PlayQueueResult{Queue: q, Entries: entries, TargetOnline: s.online(userID, q.TargetDeviceID)}, nil
 }
 
-// resolveQueue removes stale local tracks from a saved queue while retaining
-// metadata-only entries for remote tracks that have not been downloaded yet.
+// resolveQueue batch-resolves catalog tracks, removes stale local IDs, and
+// retains remote IDs even when the saving client supplied no display metadata.
 // A local track missing from the catalog can never be streamed; restoring it
 // would leave the player apparently active on an unplayable track.
 func (s *PlayQueueService) resolveQueue(ctx context.Context, q models.PlayQueue) (models.PlayQueue, []models.Track, error) {
 	entryMeta := make(map[string]models.QueueEntry, len(q.Entries))
 	for _, entry := range q.Entries {
 		entryMeta[entry.ID] = entry
+	}
+	catalogTracks, err := s.catalog.TracksByIDs(ctx, q.TrackIDs)
+	if err != nil {
+		return q, nil, err
 	}
 
 	currentIndex := -1
@@ -163,8 +167,8 @@ func (s *PlayQueueService) resolveQueue(ctx context.Context, q models.PlayQueue)
 	tracks := make([]models.Track, 0, len(q.TrackIDs))
 	originalIndexes := make([]int, 0, len(q.TrackIDs))
 	for i, id := range q.TrackIDs {
-		track, err := s.catalog.GetTrack(ctx, id)
-		if err == nil {
+		track, found := catalogTracks[id]
+		if found {
 			trackIDs = append(trackIDs, id)
 			tracks = append(tracks, track)
 			originalIndexes = append(originalIndexes, i)
@@ -174,31 +178,28 @@ func (s *PlayQueueService) resolveQueue(ctx context.Context, q models.PlayQueue)
 			})
 			continue
 		}
-		if !errors.Is(err, persistence.ErrNotFound) {
-			return q, nil, err
-		}
 
-		// Only retain an unresolved id when it is known to be a remote track.
-		// Falling back for a deleted local track makes it look playable even
-		// though the eventual stream request will return 404.
+		// Retain remote IDs even when a Subsonic client supplied no display
+		// metadata. The ID can still be mirrored/saved; only add a display track
+		// when metadata exists. Missing local IDs must be dropped because their
+		// streams cannot be resolved.
 		meta, hasMeta := entryMeta[id]
-		if !hasMeta || (!meta.Remote && !IsRemoteID(id)) {
+		if !IsRemoteID(id) && (!hasMeta || !meta.Remote) {
 			continue
 		}
 		trackIDs = append(trackIDs, id)
 		originalIndexes = append(originalIndexes, i)
-		track = models.Track{ID: id, Remote: true}
-		if hasMeta {
-			track.Title = meta.Title
-			track.ArtistName = meta.Artist
-			track.AlbumName = meta.Album
-			track.CoverArt = meta.CoverArt
-			track.Duration = meta.Duration
-			entries = append(entries, models.QueueEntry{
-				ID: id, Title: meta.Title, Artist: meta.Artist, Album: meta.Album,
-				CoverArt: meta.CoverArt, Duration: meta.Duration, Remote: true,
-			})
+		if !hasMeta {
+			continue
 		}
+		track = models.Track{
+			ID: id, Title: meta.Title, ArtistName: meta.Artist, AlbumName: meta.Album,
+			CoverArt: meta.CoverArt, Duration: meta.Duration, Remote: true,
+		}
+		entries = append(entries, models.QueueEntry{
+			ID: id, Title: meta.Title, Artist: meta.Artist, Album: meta.Album,
+			CoverArt: meta.CoverArt, Duration: meta.Duration, Remote: true,
+		})
 		tracks = append(tracks, track)
 	}
 
